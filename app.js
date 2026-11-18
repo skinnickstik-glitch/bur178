@@ -46,11 +46,18 @@ const ic = (n, cls = "") => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hid
 let S = null;
 function defaults() {
   return { brand: { ...CFG.brand }, minOrder: CFG.minOrder, travelFee: CFG.travelFee,
+    priceVersion: CFG.priceVersion || 1,
     zones: JSON.parse(JSON.stringify(CFG.zones || [])), items: JSON.parse(JSON.stringify(CFG.items)), fabrics: JSON.parse(JSON.stringify(CFG.fabrics)), extras: JSON.parse(JSON.stringify(CFG.extras)) };
 }
 async function loadSettings() {
   const saved = await Store.getSettings().catch(() => null);
-  S = saved ? { ...defaults(), ...saved, brand: { ...CFG.brand, ...(saved.brand || {}) } } : defaults();
+  const ver = CFG.priceVersion || 1;
+  if (saved && saved.priceVersion === ver) {
+    S = { ...defaults(), ...saved, brand: { ...CFG.brand, ...(saved.brand || {}) } };
+  } else {
+    S = defaults();
+    if (saved?.brand) S.brand = { ...CFG.brand, ...saved.brand };
+  }
   applyBrand();
 }
 function applyBrand() {
@@ -65,7 +72,8 @@ const amtOf = (v, l) => Math.max(v.min ?? 0, Number.isFinite(+l.amount) ? +l.amo
 function linePrice(l) {
   const it = itemById(l.itemId); if (!it) return 0;
   const v = it.variants ? (it.variants.find(v => v.id === l.variantId) || it.variants[0]) : null;
-  let base = it.perArea ? Math.max(it.minArea || 0, +l.area || 0) * it.pricePerM2 : it.perUnit ? v.price * amtOf(v, l) : v.price;
+  let base = it.id === "drill" ? drillPrice(amtOf(v || { min: 0, def: 0 }, l), v?.id)
+    : it.perArea ? Math.max(it.minArea || 0, +l.area || 0) * it.pricePerM2 : it.perUnit ? v.price * amtOf(v, l) : v.price;
   if (it.sides && l.sides === 2) base *= 1.8;
   const f = S.fabrics.find(f => f.id === l.fabric); if (f) base *= f.k;
   let add = 0;
@@ -118,21 +126,52 @@ function bindGo() { $$("[data-go]").forEach(b => b.onclick = () => goTo(b.datase
 function toast(msg) { const t = document.createElement("div"); t.className = "toast"; t.textContent = msg; document.body.appendChild(t); setTimeout(() => t.classList.add("show")); setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 300); }, 2200); }
 
 
-// ---------- калькулятор: глубина + тип трубы + обустройство ----------
+// ---------- калькулятор: глубина + обсадка + обустройство + кессон ----------
 const isWell = () => CFG.calcMode === "pipe-well" || CFG.calcMode === "rock-well";
 function drillItem() { return (S && S.items.find(i => i.id === "drill")) || (CFG.items.find(i => i.id === "drill")) || {}; }
+function maxDepth() { return drillItem().maxDepth || 120; }
 function wellDefaults() {
   const vars = drillItem().variants || [];
-  return { depth: vars[0]?.def || 40, pipe: vars[0]?.id || "", arrange: "adapter" };
+  return { depth: vars[0]?.def || 30, pipe: vars[0]?.id || "plastic", arrange: "", kesson: false };
 }
-function wellState() { return { ...wellDefaults(), ...(draft.well || {}) }; }
-function setWell(patch) { draft.well = { ...wellState(), ...patch }; syncWellCart(); }
-function wellCart(w = wellState()) {
+function normalizeWell(raw = {}) {
+  const pipes = (drillItem().variants || []).map(v => v.id);
+  const oldPlastic = new Set(["npvh125_5", "npvh125_6", "npvh129_8"]);
+  let pipe = raw.pipe;
+  if (oldPlastic.has(pipe)) pipe = "plastic";
+  if (pipe === "steel127") pipe = "metal";
+  if (!pipes.includes(pipe)) pipe = pipes[0] || "plastic";
+  const arrIds = ((S && S.items.find(i => i.id === "arrange")) || CFG.items.find(i => i.id === "arrange") || {}).variants?.map(v => v.id) || [];
+  let arrange = raw.arrange || "";
+  let kesson = !!raw.kesson;
+  if (arrange === "kesson_ring" || arrange === "kesson_plastic" || arrange === "kesson_metal") { kesson = true; arrange = ""; }
+  if (arrange === "adapter" || (arrange && !arrIds.includes(arrange))) arrange = "";
+  const depth = Math.max(0, Math.min(maxDepth(), Math.round(+raw.depth || 0)));
+  return { depth, pipe, arrange, kesson };
+}
+function wellState() { return normalizeWell({ ...wellDefaults(), ...(draft.well || {}) }); }
+function setWell(patch) { draft.well = normalizeWell({ ...wellState(), ...patch }); syncWellCart(); }
+function wellCart(w) {
+  w = normalizeWell(w || wellState());
   const cart = [];
   const line = (itemId, variantId, amount) => ({ itemId, variantId, amount, extras: [], qty: 1 });
   if (w.depth > 0 && w.pipe) cart.push(line("drill", w.pipe, +w.depth));
   if (w.arrange) cart.push({ itemId: "arrange", variantId: w.arrange, extras: [], qty: 1 });
+  if (w.kesson) cart.push({ itemId: "kesson", variantId: "kesson", extras: [], qty: 1 });
   return cart;
+}
+function drillPrice(depth, pipeId) {
+  const it = drillItem();
+  const minP = it.minPrice || 0;
+  const cap = it.maxDepth || 120;
+  const n = Math.max(0, Math.min(cap, Math.round(+depth || 0)));
+  if (n <= 0) return 0;
+  const v = (it.variants || []).find(x => x.id === pipeId) || (it.variants || [])[0];
+  if (!v) return 0;
+  if (v.id === "metal") return Math.max(minP, n * (v.price || 0));
+  const rate = n <= 60 ? (v.price || 0) : (v.rate120 || v.price || 0);
+  if (n <= 30) return minP;
+  return Math.max(minP, n * rate);
 }
 function syncWellCart() {
   draft.cart = wellCart();
@@ -141,59 +180,65 @@ function syncWellCart() {
   drawWellPrices();
 }
 function pipeHint(v) {
-  const rec = v.recLabel || (v.recMax ? "до " + v.recMax + " м" : "");
-  const bits = ["с переводом Ø90/5"];
-  if (rec) bits.push(rec);
-  bits.push("от " + rub(v.price) + "/м");
+  if (v.id === "metal") return "от " + rub(v.price) + "/м";
+  const minP = drillItem().minPrice || 0;
+  const bits = [];
+  if (minP) bits.push("до 30 м — от " + rub(minP));
+  bits.push("до 60 м — от " + rub(v.price) + "/м");
+  if (v.rate120) bits.push("до 120 м — от " + rub(v.rate120) + "/м");
   return bits.join(" · ");
 }
 function wellCalcHtml() {
   const w = wellState();
   const pipes = drillItem().variants || [];
   const arr = (S.items.find(i => i.id === "arrange") || {}).variants || [];
-  const pipe = pipes.find(v => v.id === w.pipe) || pipes[0] || {};
-  const over = pipe.recMax && w.depth > pipe.recMax;
+  const kesson = (S.items.find(i => i.id === "kesson") || {}).variants?.[0];
+  const arrHint = (S.items.find(i => i.id === "arrange") || {}).hint || "В обустройство включены материалы, доставка и работа.";
   return `<div class="well-calc" id="well-calc">
     <div class="wrow">
-      <div class="wmeta"><b>Глубина скважины</b><small>Ориентировочный метраж, точная глубина — по факту бурения</small></div>
+      <div class="wmeta"><b>Глубина скважины</b><small>Ориентировочный метраж, до 120 м. Точная глубина — по факту бурения</small></div>
       <div class="stepper">
         <button type="button" data-well="depth" data-d="-1" aria-label="Меньше">−</button>
-        <input id="w-depth" type="number" min="0" max="200" step="1" value="${esc(w.depth)}" inputmode="numeric">
+        <input id="w-depth" type="number" min="0" max="${maxDepth()}" step="1" value="${esc(w.depth)}" inputmode="numeric">
         <button type="button" data-well="depth" data-d="1" aria-label="Больше">+</button>
       </div>
       <b class="wprice p" id="w-drill-price"></b>
     </div>
+    <p class="w-hint" id="w-min-hint" hidden></p>
     <p class="w-arr-h">Обсадная труба</p>
     <div class="wopts wopts-pipe" id="w-pipe">
       ${pipes.map(v => `<button type="button" data-pipe="${v.id}" class="${w.pipe === v.id ? "on" : ""}"><b>${esc(v.shortTitle || v.title)}</b><small>${pipeHint(v)}</small></button>`).join("")}
     </div>
-    <p class="w-hint" id="w-pipe-hint" ${over ? "" : "hidden"}></p>
     <p class="w-arr-h">Обустройство</p>
     <div class="wopts" id="w-arrange">
       <button type="button" data-arr="" class="${!w.arrange ? "on" : ""}"><b>Без обустройства</b><small>только бурение и обсадка</small></button>
       ${arr.map(v => `<button type="button" data-arr="${v.id}" class="${w.arrange === v.id ? "on" : ""}"><b>${esc(v.title)}</b><small>от ${rub(v.price)}</small></button>`).join("")}
     </div>
-    <p class="price-src">Цены с сайта bur178.ru — при необходимости заменим на ваш актуальный прайс.</p>
+    ${kesson ? `<label class="check wide wcheck"><input id="w-kesson" type="checkbox"${w.kesson ? " checked" : ""}> <span>${esc(kesson.title)}<small>от ${rub(kesson.price)}</small></span></label>` : ""}
+    <p class="price-src">${esc(arrHint)}</p>
   </div>`;
 }
 function drawWellPrices() {
   if (!$("#well-calc")) return;
   const w = wellState();
-  const pipes = drillItem().variants || [];
-  const pipe = pipes.find(v => v.id === w.pipe);
-  const rate = pipe?.price || 0;
+  const price = drillPrice(w.depth, w.pipe);
   const el = $("#w-drill-price");
-  if (el) el.textContent = w.depth > 0 && rate ? "от " + rub(w.depth * rate) : "—";
-  const hint = $("#w-pipe-hint");
+  if (el) el.textContent = w.depth > 0 && price ? "от " + rub(price) : "—";
+  const hint = $("#w-min-hint");
   if (hint) {
-    const over = pipe?.recMax && w.depth > pipe.recMax;
-    hint.hidden = !over;
-    if (over) hint.textContent = "На сайте этот диаметр указан " + (pipe.recLabel || ("до " + pipe.recMax + " м")) + ". Для такой глубины обычно берут другую трубу — можно выбрать её выше.";
+    const it = drillItem();
+    const minP = it.minPrice || 0;
+    const v = (it.variants || []).find(x => x.id === w.pipe);
+    const raw = v ? (v.id === "metal" ? w.depth * v.price : w.depth <= 30 ? 0 : w.depth * (w.depth <= 60 ? v.price : (v.rate120 || v.price))) : 0;
+    const show = minP && w.depth > 0 && raw < minP;
+    hint.hidden = !show;
+    if (show) hint.textContent = "Минимальный заказ на скважину до 30 м — от " + rub(minP) + ".";
   }
 }
 function bindWellCalc() {
   if (!draft.well) draft.well = wellDefaults();
-  const clamp = n => Math.max(0, Math.min(200, n));
+  draft.well = wellState();
+  const clamp = n => Math.max(0, Math.min(maxDepth(), n));
   const read = commit => {
     const el = $("#w-depth");
     if (!commit && el.value === "") return;
@@ -217,10 +262,12 @@ function bindWellCalc() {
     $$("#w-arrange [data-arr]").forEach(x => x.classList.toggle("on", x === b));
     setWell({ arrange: b.dataset.arr });
   });
+  const kes = $("#w-kesson");
+  if (kes) kes.onchange = e => setWell({ kesson: e.target.checked });
   syncWellCart();
 }
-function priceTest(depth, pipe, arrange) {
-  const cart = wellCart({ depth, pipe, arrange });
+function priceTest(depth, pipe, arrange, kesson = false) {
+  const cart = wellCart({ depth, pipe, arrange, kesson });
   const t = total(cart, "");
   return {
     lines: cart.map(l => ({ title: lineTitle(l), price: Math.round(linePrice(l)) })),
@@ -511,14 +558,14 @@ function reqCard(r) {
 function panePrices() {
   const p = $("#pane");
   p.innerHTML = `<div class="card"><h3>Прайс-лист</h3><p class="note">Изменения сразу появляются у клиентов в калькуляторе.</p>
-    ${S.items.map((it, i) => `<div class="pr"><b>${esc(it.title)}</b>${it.perArea ? `<label>за м²<input type="number" data-i="${i}" data-k="m2" value="${it.pricePerM2}"></label>` : it.variants.map((v, j) => `<label>${esc(v.title)}${it.perUnit ? ", ₽/" + it.perUnit.unit : ""}<input type="number" data-i="${i}" data-j="${j}" value="${v.price}"></label>`).join("")}</div>`).join("")}
+    ${S.items.map((it, i) => `<div class="pr"><b>${esc(it.title)}</b>${it.perArea ? `<label>за м²<input type="number" data-i="${i}" data-k="m2" value="${it.pricePerM2}"></label>` : it.variants.map((v, j) => `<label>${esc(v.title)}${it.perUnit ? ", ₽/" + it.perUnit.unit : ""}${v.rate120 != null ? " (до 60 м)" : ""}<input type="number" data-i="${i}" data-j="${j}" value="${v.price}"></label>${v.rate120 != null ? `<label>${esc(v.shortTitle || v.title)}, ₽/м (до 120 м)<input type="number" data-i="${i}" data-j="${j}" data-k="rate120" value="${v.rate120}"></label>` : ""}`).join("")}${it.minPrice != null ? `<label>Минимальный заказ на скважину, ₽<input type="number" data-i="${i}" data-k="minPrice" value="${it.minPrice}"></label>` : ""}</div>`).join("")}
     <div class="pr"><b>Дополнительно</b>${S.extras.map((e, i) => `<label>${esc(e.title)}, ${e.type === "percent" ? "%" : "₽"}<input type="number" data-e="${i}" value="${e.value}"></label>`).join("")}</div>
     ${S.fabrics.length ? `<div class="pr"><b>${esc(CFG.fabricLabel || "Класс авто")} (коэффициент)</b>${S.fabrics.map((f, i) => `<label>${esc(f.title)}<input type="number" step="0.05" data-fb="${i}" value="${f.k}"></label>`).join("")}</div>` : ""}
     ${S.zones?.length ? `<div class="pr"><b>Выезд техники по удалённости, ₽</b>${S.zones.map((z, i) => `<label>${esc(z.title)}<input type="number" data-z="${i}" value="${z.fee}"></label>`).join("")}</div>` : ""}
     <div class="pr"><b>Общее</b><label>Минимальный заказ, ₽<input type="number" id="minOrder" value="${S.minOrder}"></label><label>Доплата за срочность, ₽<input type="number" id="travel" value="${S.travelFee}"></label></div>
     <div class="row"><button class="btn" id="savep">Сохранить прайс</button><button class="btn ghost" id="resetp">Вернуть по умолчанию</button></div></div>`;
   $("#savep").onclick = async () => {
-    $$("input[data-i]", p).forEach(inp => { const it = S.items[+inp.dataset.i]; if (inp.dataset.k === "m2") it.pricePerM2 = +inp.value; else it.variants[+inp.dataset.j].price = +inp.value; });
+    $$("input[data-i]", p).forEach(inp => { const it = S.items[+inp.dataset.i]; if (inp.dataset.k === "m2") it.pricePerM2 = +inp.value; else if (inp.dataset.k === "minPrice") it.minPrice = +inp.value; else if (inp.dataset.k === "rate120") it.variants[+inp.dataset.j].rate120 = +inp.value; else it.variants[+inp.dataset.j].price = +inp.value; });
     $$("input[data-e]", p).forEach(inp => S.extras[+inp.dataset.e].value = +inp.value);
     $$("input[data-fb]", p).forEach(inp => S.fabrics[+inp.dataset.fb].k = +inp.value);
     $$("input[data-z]", p).forEach(inp => S.zones[+inp.dataset.z].fee = +inp.value);
@@ -545,14 +592,14 @@ async function seed() {
   const mk = (cart, client, date, slot, zone = "z0") => { const z = zoneOf(zone); const items = cart.map(l => ({ ...l, title: lineTitle(l), price: Math.round(linePrice(l)) }));
     if (cart.length && z.fee) items.push({ itemId: "_zone", title: "Выезд техники: " + lc(z.title), price: z.fee });
     return { client: { ...client, zone: z.title }, date, slot, items, estimate: Math.round(total(cart, zone).final), photos: [sampleImg(cart[0]?.itemId)] }; };
-  const a = await Store.create(mk([{ itemId: "drill", variantId: "npvh125_5", amount: 40, extras: [] }, { itemId: "arrange", variantId: "adapter", extras: [] }],
-    { name: "Сергей", phone: "+7 (911) 123-45-67", address: "Всеволожский р-н, д. Новое Девяткино, ул. Лесная, уч. 48", floor: "", comment: "Нужна вода в дом круглый год, адаптер", visit: true }, d(1), "11:00"));
-  const b = await Store.create(mk([{ itemId: "drill", variantId: "npvh125_6", amount: 50, extras: [] }, { itemId: "arrange", variantId: "kesson_plastic", extras: [] }],
-    { name: "Марина", phone: "+7 (911) 765-43-21", address: "Гатчинский р-н, пос. Вырица, ул. Садовая, 12", floor: "", comment: "Хотим под ключ с пластиковым кессоном", visit: true }, d(2), "13:00"));
+  const a = await Store.create(mk([{ itemId: "drill", variantId: "plastic", amount: 40, extras: [] }, { itemId: "arrange", variantId: "winter", extras: [] }],
+    { name: "Сергей", phone: "+7 (911) 123-45-67", address: "Всеволожский р-н, д. Новое Девяткино, ул. Лесная, уч. 48", floor: "", comment: "Нужна вода в дом круглый год", visit: true }, d(1), "11:00"));
+  const b = await Store.create(mk([{ itemId: "drill", variantId: "plastic", amount: 50, extras: [] }, { itemId: "arrange", variantId: "winter", extras: [] }, { itemId: "kesson", variantId: "kesson", extras: [] }],
+    { name: "Марина", phone: "+7 (911) 765-43-21", address: "Гатчинский р-н, пос. Вырица, ул. Садовая, 12", floor: "", comment: "Хотим под ключ с кессоном", visit: true }, d(2), "13:00"));
   await Store.update(b.id, { status: "confirmed", confirmedTime: "через 2 дня, 13:00", masterNote: "Посмотрим подъезд и место бурения, смету подтвердим после осмотра" });
-  const c = await Store.create(mk([{ itemId: "drill", variantId: "npvh125_5", amount: 30, extras: [] }, { itemId: "arrange", variantId: "summer", extras: [] }],
-    { name: "Алексей", phone: "+7 (921) 555-12-34", address: "Ломоносовский р-н, СНТ «Рассвет», уч. 112", floor: "", comment: "Летняя колонка для полива и бани", visit: false }, d(0), "9:00"));
-  await Store.update(c.id, { status: "done", finalPrice: 142000 });
+  const c = await Store.create(mk([{ itemId: "drill", variantId: "plastic", amount: 30, extras: [] }, { itemId: "arrange", variantId: "summer", extras: [] }],
+    { name: "Алексей", phone: "+7 (921) 555-12-34", address: "Ломоносовский р-н, СНТ «Рассвет», уч. 112", floor: "", comment: "Летнее обустройство для полива и бани", visit: false }, d(0), "9:00"));
+  await Store.update(c.id, { status: "done", finalPrice: 225000 });
 }
 // пример фото участка для демо-заявок (иллюстрация из /img)
 function sampleImg() { return "img/house.webp"; }
