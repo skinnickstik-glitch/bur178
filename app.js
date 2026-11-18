@@ -186,7 +186,7 @@ function pipeHint(v) {
   if (minP) bits.push("до 30 м — от " + rub(minP));
   bits.push("до 60 м — от " + rub(v.price) + "/м");
   if (v.rate120) bits.push("до 120 м — от " + rub(v.rate120) + "/м");
-  return bits.join(" · ");
+  return bits.join("<br>");
 }
 function wellCalcHtml() {
   const w = wellState();

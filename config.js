@@ -122,9 +122,9 @@ window.APP_CONFIG = {
     { id: "arrange", title: "Обустройство скважины", model: "caisson",
       hint: "В обустройство включены материалы, доставка и работа.",
       variants: [
-        { id: "summer", title: "Обустройство «лето»", price: 75000 },
-        { id: "partial", title: "Обустройство частичное", price: 10500 },
-        { id: "winter", title: "Обустройство полное зимнее", price: 18000 },
+        { id: "summer", title: "Обустройство «лето»", shortTitle: "«лето»", price: 75000 },
+        { id: "partial", title: "Обустройство частичное", shortTitle: "частичное", price: 10500 },
+        { id: "winter", title: "Обустройство полное зимнее", shortTitle: "полное зимнее", price: 18000 },
       ] },
     { id: "kesson", title: "Кессон", model: "caisson",
       variants: [
